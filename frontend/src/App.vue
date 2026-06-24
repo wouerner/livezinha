@@ -1,7 +1,8 @@
 <script setup>
 import { ref, onMounted, onUnmounted, computed } from 'vue'
+import DatePicker from './components/DatePicker.vue'
 
-const apiBaseUrl = 'http://192.168.15.10/api'
+const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || 'http://localhost/api'
 
 // View Routing State
 const currentView = ref('public') // 'public' | 'admin' | 'obs'
@@ -243,7 +244,7 @@ const createLive = async () => {
       headers: authHeaders(),
       body: JSON.stringify({
         title: newLiveForm.value.title,
-        scheduled_at: newLiveForm.value.scheduled_at.replace('T', ' '),
+        scheduled_at: newLiveForm.value.scheduled_at,
       }),
     })
     if (response.ok) {
@@ -812,11 +813,9 @@ onUnmounted(() => {
           </div>
           <div class="form-group">
             <label class="form-label" style="font-size: 0.75rem;">Data e Hora</label>
-            <input 
+            <DatePicker
               v-model="newLiveForm.scheduled_at"
-              type="datetime-local" 
-              class="form-input" 
-              required
+              placeholder="Selecione data e hora"
             />
           </div>
           <button type="submit" class="btn-primary" style="padding: 0.7rem 1.2rem; font-size:0.85rem;" :disabled="isCreatingLive">
