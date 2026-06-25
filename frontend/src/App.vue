@@ -86,6 +86,8 @@ const lives = ref([])
 const selectedLive = ref(null)
 const newLiveForm = ref({
   title: '',
+  streamer_name: '',
+  live_url: '',
   scheduled_at: '',
 })
 const isCreatingLive = ref(false)
@@ -256,6 +258,24 @@ const copyPasscode = () => {
   }, 2000)
 }
 
+const shareLive = async (live) => {
+  const shareUrl = window.location.origin + '/#/public'
+  const shareTitle = `📺 ${live.title}`
+  const shareText = live.live_url
+    ? `Assista à live "${live.title}"${live.streamer_name ? ' com ' + live.streamer_name : ''}!\n\n📡 Link da transmissão: ${live.live_url}\n\n💬 Envie sua pergunta: ${shareUrl}`
+    : `Participe da live "${live.title}"${live.streamer_name ? ' com ' + live.streamer_name : ''}!\n\n💬 Envie sua pergunta: ${shareUrl}`
+
+  if (navigator.share) {
+    try {
+      await navigator.share({ title: shareTitle, text: shareText, url: shareUrl })
+    } catch { /* user cancelled */ }
+  } else {
+    await navigator.clipboard.writeText(shareText)
+    copySuccess.value = true
+    setTimeout(() => { copySuccess.value = false }, 2000)
+  }
+}
+
 const resetSuccessScreen = () => {
   generatedPasscode.value = ''
   selectedPublicLive.value = null
@@ -298,6 +318,8 @@ const createLive = async () => {
       headers: authHeaders(),
       body: JSON.stringify({
         title: newLiveForm.value.title,
+        streamer_name: newLiveForm.value.streamer_name || null,
+        live_url: newLiveForm.value.live_url || null,
         scheduled_at: newLiveForm.value.scheduled_at,
       }),
     })
@@ -306,6 +328,8 @@ const createLive = async () => {
       lives.value.unshift(data)
       selectedLive.value = data
       newLiveForm.value.title = ''
+      newLiveForm.value.streamer_name = ''
+      newLiveForm.value.live_url = ''
       newLiveForm.value.scheduled_at = ''
       fetchAdminQuestions()
     }
@@ -330,6 +354,21 @@ const toggleLiveStatus = async (status) => {
     }
   } catch (error) {
     console.error('Failed to update live status:', error)
+  }
+}
+
+const updateLive = async (id, data) => {
+  try {
+    const response = await fetch(`${apiBaseUrl}/lives/${id}`, {
+      method: 'PUT',
+      headers: authHeaders(),
+      body: JSON.stringify(data),
+    })
+    if (response.ok) {
+      fetchLives()
+    }
+  } catch (error) {
+    console.error('Failed to update live:', error)
   }
 }
 
@@ -775,18 +814,33 @@ onUnmounted(() => {
                       link
                       style="border: 1px solid rgba(255,255,255,0.05);"
                     >
-                      <v-list-item-title class="text-white font-weight-bold">{{ live.title }}</v-list-item-title>
+                      <v-list-item-title class="text-white font-weight-bold">
+                        {{ live.title }}
+                        <span v-if="live.streamer_name" class="text-caption text-grey-lighten-2 font-weight-regular ml-2">por {{ live.streamer_name }}</span>
+                      </v-list-item-title>
                       <v-list-item-subtitle class="text-grey-lighten-1">
                         {{ formatDateTime(live.scheduled_at) }}
                       </v-list-item-subtitle>
                       <template v-slot:append>
-                        <v-chip
-                          size="small"
-                          :color="live.status === 'active' ? 'error' : 'primary'"
-                          variant="flat"
-                        >
-                          {{ live.status === 'active' ? 'Ao Vivo' : 'Agendada' }}
-                        </v-chip>
+                        <div class="d-flex align-center" style="gap: 0.25rem;">
+                          <v-btn
+                            v-if="live.live_url"
+                            :href="live.live_url"
+                            target="_blank"
+                            size="x-small"
+                            icon="mdi-open-in-new"
+                            variant="text"
+                            color="grey-lighten-1"
+                            title="Abrir transmissão"
+                          ></v-btn>
+                          <v-chip
+                            size="small"
+                            :color="live.status === 'active' ? 'error' : 'primary'"
+                            variant="flat"
+                          >
+                            {{ live.status === 'active' ? 'Ao Vivo' : 'Agendada' }}
+                          </v-chip>
+                        </div>
                       </template>
                     </v-list-item>
                   </v-list>
@@ -804,11 +858,25 @@ onUnmounted(() => {
                       <div>
                         <span class="text-caption text-uppercase text-grey-lighten-1 d-block font-weight-bold">Live Selecionada</span>
                         <span class="text-subtitle-1 text-white font-weight-bold d-block">{{ selectedPublicLive.title }}</span>
-                        <span class="text-caption text-grey-lighten-2">{{ formatDateTime(selectedPublicLive.scheduled_at) }}</span>
+                        <span class="text-caption text-grey-lighten-2">
+                          {{ formatDateTime(selectedPublicLive.scheduled_at) }}
+                          <template v-if="selectedPublicLive.streamer_name"> · por {{ selectedPublicLive.streamer_name }}</template>
+                        </span>
                       </div>
-                      <v-btn size="small" variant="outlined" color="white" @click="selectedPublicLive = null">
-                        Trocar
-                      </v-btn>
+                      <div class="d-flex" style="gap: 0.5rem;">
+                        <v-btn
+                          size="small"
+                          variant="outlined"
+                          color="white"
+                          prepend-icon="mdi-share-variant"
+                          @click="shareLive(selectedPublicLive)"
+                        >
+                          Compartilhar
+                        </v-btn>
+                        <v-btn size="small" variant="outlined" color="white" @click="selectedPublicLive = null">
+                          Trocar
+                        </v-btn>
+                      </div>
                     </div>
                   </v-alert>
 
@@ -1032,6 +1100,24 @@ onUnmounted(() => {
                   density="compact"
                   class="mb-3"
                 ></v-text-field>
+
+                <v-text-field
+                  v-model="newLiveForm.streamer_name"
+                  label="Nome do Streamer"
+                  placeholder="Ex: Admin"
+                  variant="outlined"
+                  density="compact"
+                  class="mb-3"
+                ></v-text-field>
+
+                <v-text-field
+                  v-model="newLiveForm.live_url"
+                  label="Link da Transmissão"
+                  placeholder="Ex: https://twitch.tv/seucanal"
+                  variant="outlined"
+                  density="compact"
+                  class="mb-3"
+                ></v-text-field>
                 
                 <div class="mb-3">
                   <span class="text-caption text-grey-lighten-1 d-block mb-1">Data e Hora</span>
@@ -1093,7 +1179,47 @@ onUnmounted(() => {
                   <v-col cols="12" sm="7">
                     <span class="text-caption text-uppercase text-grey-lighten-1 font-weight-bold">Live Selecionada</span>
                     <h2 class="text-h5 font-weight-bold text-white my-1">{{ selectedLive.title }}</h2>
-                    <p class="text-caption text-grey-lighten-2 mb-0">Agendada: {{ formatDateTime(selectedLive.scheduled_at) }}</p>
+                    <div class="d-flex align-center mt-1" style="gap: 0.5rem;">
+                      <v-text-field
+                        v-model="selectedLive.streamer_name"
+                        label="Streamer"
+                        placeholder="Nome do streamer"
+                        variant="outlined"
+                        density="compact"
+                        hide-details
+                        class="mb-0"
+                        style="max-width: 200px;"
+                      ></v-text-field>
+                      <v-text-field
+                        v-model="selectedLive.live_url"
+                        label="Link da Live"
+                        placeholder="https://twitch.tv/..."
+                        variant="outlined"
+                        density="compact"
+                        hide-details
+                        class="mb-0"
+                        style="max-width: 300px;"
+                      ></v-text-field>
+                      <v-btn
+                        v-if="selectedLive.live_url"
+                        :href="selectedLive.live_url"
+                        target="_blank"
+                        size="x-small"
+                        icon="mdi-open-in-new"
+                        variant="text"
+                        color="grey-lighten-1"
+                        title="Abrir link"
+                      ></v-btn>
+                      <v-btn
+                        size="x-small"
+                        color="primary"
+                        variant="flat"
+                        @click="updateLive(selectedLive.id, { streamer_name: selectedLive.streamer_name, live_url: selectedLive.live_url })"
+                      >
+                        Salvar
+                      </v-btn>
+                    </div>
+                    <p class="text-caption text-grey-lighten-2 mt-1 mb-0">Agendada: {{ formatDateTime(selectedLive.scheduled_at) }}</p>
                   </v-col>
                   <v-col cols="12" sm="5" class="d-flex justify-sm-end" style="gap: 0.5rem;">
                     <v-btn

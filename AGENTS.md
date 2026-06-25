@@ -34,7 +34,7 @@ No lint, test, or typecheck commands configured for frontend.
 - JSON-only responses (middleware in `bootstrap/app.php` targets `api/*`)
 - Frontend hardcodes `apiBaseUrl = 'http://localhost/api'`
 - No authentication on public endpoints (`/lives/active`, `/lives/active/question`, question creation)
-- Sanctum auth on `/user` only
+- Sanctum auth on admin CRUD endpoints (`/lives/*`, `/questions/*` excluding POST `/questions`)
 
 ## Database
 
@@ -42,13 +42,16 @@ No lint, test, or typecheck commands configured for frontend.
 - Tests use **SQLite in-memory** (`phpunit.xml` sets `DB_CONNECTION=sqlite`, `DB_DATABASE=testing`)
 - Session, cache, and queue all backed by the database
 - Run migrations: `php artisan migrate`
+- Seed database: `php artisan db:seed`
+- Reset everything (migrate fresh + seed): `php artisan migrate:fresh --seed`
+- Default admin user after seeding: `admin@livezinha.com` / `admin123`
 
 ## Models & Migrations
 
-- `LiveStream` — `hasMany(Question)`, fields: `title`, `scheduled_at`, `status`
+- `LiveStream` — `hasMany(Question)`, fields: `title`, `streamer_name`, `live_url`, `scheduled_at`, `status`
 - `Question` — `belongsTo(LiveStream)`, fields: `live_stream_id`, `name`, `tiktok_handle`, `question_text`, `passcode`, `status`, `is_tagged`
 - `Note` — standalone, fields: `title`, `content`
-- Passcode generation: Portuguese noun-adjective-number string (`gato-azul-42`), unique across all questions
+- Passcode generation: Portuguese noun-adjective string (`gato-azul`), unique across all questions
 
 ## Frontend architecture
 
@@ -66,5 +69,6 @@ No lint, test, or typecheck commands configured for frontend.
 ## Dev environment
 
 - Laravel Sail (`./vendor/bin/sail up`) runs Docker with PHP 8.5 + MySQL 8.4
+- Run artisan commands via `docker exec -w /var/www/html backend-laravel.test-1 php artisan <cmd>` (or `./vendor/bin/sail artisan <cmd>` if Sail is configured)
 - `compose.yaml` vendor-published (do not edit directly)
 - Recommended VS Code extension for frontend: `Vue.volar`

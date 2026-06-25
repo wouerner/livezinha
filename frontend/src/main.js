@@ -9,7 +9,18 @@ import '@mdi/font/css/materialdesignicons.css'
 
 const vuetify = createVuetify({
   theme: {
-    defaultTheme: 'dark', // Let's default to a nice dark theme!
+    defaultTheme: 'dark',
+    themes: {
+      dark: {
+        colors: {
+          primary: '#b84a3a',
+          accent: '#d97706',
+          error: '#ef4444',
+          success: '#10b981',
+          warning: '#f59e0b',
+        },
+      },
+    },
   },
 })
 
