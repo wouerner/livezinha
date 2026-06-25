@@ -14,17 +14,20 @@ const inputRef = ref(null)
 let fp = null
 
 onMounted(() => {
-  fp = flatpickr(inputRef.value, {
-    enableTime: true,
-    dateFormat: 'Y-m-d H:i:S',
-    time_24hr: true,
-    minuteIncrement: 5,
-    defaultHour: 20,
-    defaultMinute: 0,
-    onChange: (selectedDates, dateStr) => {
-      emit('update:modelValue', dateStr)
-    },
-  })
+  const nativeInput = inputRef.value?.$el?.querySelector('input')
+  if (nativeInput) {
+    fp = flatpickr(nativeInput, {
+      enableTime: true,
+      dateFormat: 'Y-m-d H:i:S',
+      time_24hr: true,
+      minuteIncrement: 5,
+      defaultHour: 20,
+      defaultMinute: 0,
+      onChange: (selectedDates, dateStr) => {
+        emit('update:modelValue', dateStr)
+      },
+    })
+  }
 })
 
 watch(() => props.modelValue, (val) => {
@@ -39,12 +42,15 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <input
+  <v-text-field
     ref="inputRef"
-    type="text"
-    class="form-input"
     :placeholder="placeholder"
-    :value="modelValue"
+    :model-value="modelValue"
     readonly
+    prepend-inner-icon="mdi-calendar-clock"
+    variant="outlined"
+    density="comfortable"
+    hide-details
   />
 </template>
+

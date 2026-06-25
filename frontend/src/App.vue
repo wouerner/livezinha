@@ -93,9 +93,10 @@ const adminQuestions = ref([])
 const selectedFilter = ref('all') // 'all' | 'pending' | 'approved' | 'active' | 'archived'
 
 // --- OBS VIEW STATE ---
-const activeQuestion = ref(null)
+const activeQuestions = ref([])
 let obsIntervalId = null
 let connectionIntervalId = null
+const becameOlderMap = {}
 
 // --- COMMON FUNCTIONS ---
 const checkConnection = async () => {
@@ -112,6 +113,59 @@ const checkConnection = async () => {
   } catch (error) {
     console.error('Connection check failed:', error)
     connectionStatus.value = 'offline'
+  }
+}
+
+// --- VOTE STATE ---
+const userVotes = ref(JSON.parse(localStorage.getItem('user_votes') || '{}'))
+const isVotingQuestion = ref(null) // question id being voted on
+
+const getUserVote = (questionId) => {
+  return userVotes.value[questionId] || null
+}
+
+const persistUserVotes = () => {
+  localStorage.setItem('user_votes', JSON.stringify(userVotes.value))
+}
+
+const voteQuestion = async (questionId, voteType) => {
+  isVotingQuestion.value = questionId
+  try {
+    const response = await fetch(`${apiBaseUrl}/questions/${questionId}/vote`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify({ vote: voteType }),
+    })
+    if (response.ok) {
+      const data = await response.json()
+      // Update counts in all question lists
+      const updateCounts = (q) => {
+        if (q.id === questionId) {
+          q.likes_count = data.likes_count
+          q.dislikes_count = data.dislikes_count
+        }
+        return q
+      }
+      publicQuestions.value = publicQuestions.value.map(updateCounts)
+      adminQuestions.value = adminQuestions.value.map(updateCounts)
+      activeQuestions.value = activeQuestions.value.map(updateCounts)
+
+      // Update user vote state
+      const currentVote = userVotes.value[questionId]
+      if (currentVote === voteType) {
+        delete userVotes.value[questionId]
+      } else {
+        userVotes.value[questionId] = voteType
+      }
+      persistUserVotes()
+    }
+  } catch (error) {
+    console.error('Failed to vote:', error)
+  } finally {
+    isVotingQuestion.value = null
   }
 }
 
@@ -377,16 +431,65 @@ const filteredQuestions = computed(() => {
 })
 
 // --- OBS OVERLAY FUNCTIONS ---
+const hideOBSQuestion = async (questionId) => {
+  try {
+    await fetch(`${apiBaseUrl}/questions/${questionId}`, {
+      method: 'PUT',
+      headers: authHeaders(),
+      body: JSON.stringify({ is_hidden: true }),
+    })
+  } catch (error) {
+    console.error('Failed to auto-hide OBS question:', error)
+  }
+}
+
 const fetchOBSActiveQuestion = async () => {
   try {
     const response = await fetch(`${apiBaseUrl}/lives/active/question`)
     if (response.ok) {
       const data = await response.json()
-      // Direct comparison of properties to avoid flickering
-      if (!data) {
-        activeQuestion.value = null
-      } else if (!activeQuestion.value || activeQuestion.value.id !== data.id) {
-        activeQuestion.value = data
+      const currentStr = JSON.stringify(activeQuestions.value)
+      const newStr = JSON.stringify(data || [])
+      if (currentStr !== newStr) {
+        activeQuestions.value = data || []
+      }
+
+      // Track "other" (older) questions and their timers
+      if (activeQuestions.value.length > 1) {
+        const newestId = activeQuestions.value[activeQuestions.value.length - 1].id
+        activeQuestions.value.forEach((q) => {
+          if (q.id !== newestId) {
+            // This is an older question. Mark when it became older if not already tracked.
+            if (!becameOlderMap[q.id]) {
+              becameOlderMap[q.id] = Date.now()
+            }
+          } else {
+            // Newest question is not older
+            delete becameOlderMap[q.id]
+          }
+        })
+      } else {
+        // Clear all timers since there are no older questions active
+        Object.keys(becameOlderMap).forEach(key => delete becameOlderMap[key])
+      }
+
+      // Clean up IDs that are no longer in the active list
+      const activeIds = new Set(activeQuestions.value.map(q => q.id))
+      Object.keys(becameOlderMap).forEach(idStr => {
+        const id = Number(idStr)
+        if (!activeIds.has(id)) {
+          delete becameOlderMap[idStr]
+        }
+      })
+
+      // Check if any older question has exceeded 15 seconds
+      const now = Date.now()
+      for (const [idStr, becameOlderAt] of Object.entries(becameOlderMap)) {
+        if (now - becameOlderAt >= 15000) {
+          const id = Number(idStr)
+          hideOBSQuestion(id)
+          delete becameOlderMap[idStr]
+        }
       }
     }
   } catch (error) {
@@ -428,6 +531,34 @@ const formatDateTime = (dtStr) => {
     minute: '2-digit'
   })
 }
+ 
+// Format Relative Time to Live Stream Start
+const formatRelativeTime = (timeStr, baseTimeStr) => {
+  if (!timeStr || !baseTimeStr) return null
+  const time = new Date(timeStr)
+  const base = new Date(baseTimeStr)
+  const diffMs = time - base
+  if (diffMs < 0) return '00:00'
+  
+  const totalSeconds = Math.floor(diffMs / 1000)
+  const hours = Math.floor(totalSeconds / 3600)
+  const minutes = Math.floor((totalSeconds % 3600) / 60)
+  const seconds = totalSeconds % 60
+  
+  const pad = (num) => String(num).padStart(2, '0')
+  
+  if (hours > 0) {
+    return `${pad(hours)}:${pad(minutes)}:${pad(seconds)}`
+  }
+  return `${pad(minutes)}:${pad(seconds)}`
+}
+ 
+const formatDuration = (seconds) => {
+  if (seconds === null || seconds === undefined) return null
+  const mins = Math.floor(seconds / 60)
+  const secs = seconds % 60
+  return `${mins}m ${secs}s`
+}
 
 // Lifecycle Hooks
 onMounted(() => {
@@ -456,576 +587,749 @@ onUnmounted(() => {
   <!-- ========================================== -->
   <!-- OBS OVERLAY VIEW (No surrounding container)-->
   <!-- ========================================== -->
-  <div v-if="currentView === 'obs'" style="width: 100%; height: 100%;">
-    <div v-if="activeQuestion" class="obs-card">
-      <div class="obs-left-panel">
-        <span class="obs-user-name">{{ activeQuestion.name }}</span>
-        <span class="obs-tiktok" v-if="activeQuestion.tiktok_handle">
-          <svg class="obs-tiktok-icon" viewBox="0 0 448 512">
-            <path d="M448,209.91a210.06,210.06,0,0,1-122.77-39.25V349.38A162.55,162.55,0,1,1,185,188.31c8.08,0,15.79.62,23.36,1.88l.1,0H208.5v72.33l-.1,0A89.92,89.92,0,1,0,248.8,349.38V0h79.52c1.7,46.7,29.9,85.67,69.57,105.51v74.65c-20.9-9-39.6-22.9-54.8-40.4V209.91C375.4,209.91,413.4,209.91,448,209.91Z"/>
-          </svg>
-          {{ activeQuestion.tiktok_handle }}
-        </span>
+  <div v-if="currentView === 'obs'" class="obs-container">
+    <TransitionGroup name="obs-list" tag="div" class="obs-container-inner">
+      <div 
+        v-for="(q, index) in activeQuestions" 
+        :key="q.id" 
+        :class="['obs-card', { 'is-newest': index === activeQuestions.length - 1 }]"
+      >
+        <!-- Loading timer bar for older messages -->
+        <div v-if="index !== activeQuestions.length - 1" class="obs-card-timer"></div>
+
+        <div class="obs-left-panel">
+          <span class="obs-user-name">{{ q.name }}</span>
+          <span class="obs-tiktok" v-if="q.tiktok_handle">
+            <svg class="obs-tiktok-icon" viewBox="0 0 448 512">
+              <path d="M448,209.91a210.06,210.06,0,0,1-122.77-39.25V349.38A162.55,162.55,0,1,1,185,188.31c8.08,0,15.79.62,23.36,1.88l.1,0H208.5v72.33l-.1,0A89.92,89.92,0,1,0,248.8,349.38V0h79.52c1.7,46.7,29.9,85.67,69.57,105.51v74.65c-20.9-9-39.6-22.9-54.8-40.4V209.91C375.4,209.91,413.4,209.91,448,209.91Z"/>
+            </svg>
+            {{ q.tiktok_handle }}
+          </span>
+        </div>
+        <div class="obs-question-text">
+          {{ q.question_text }}
+        </div>
+        <div class="obs-stats">
+          <span class="obs-stat">
+            <svg class="obs-stat-icon" viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M23,10C23,8.89 22.1,8 21,8H14.68L15.64,3.43C15.66,3.33 15.67,3.22 15.67,3.11C15.67,2.7 15.5,2.32 15.23,2.05L14.17,1L7.59,7.58C7.22,7.95 7,8.45 7,9V19A2,2 0 0,0 9,21H18C18.83,21 19.54,20.5 19.84,19.78L22.86,12.73C22.95,12.5 23,12.26 23,12V10M1,21H5V9H1V21Z"/></svg>
+            <span>{{ q.likes_count ?? 0 }}</span>
+          </span>
+          <span class="obs-stat">
+            <svg class="obs-stat-icon" viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M19,15H23V3H19M15,3H6C5.17,3 4.46,3.5 4.16,4.22L1.14,11.27C1.05,11.5 1,11.74 1,12V14A2,2 0 0,0 3,16H9.31L8.36,20.57C8.34,20.67 8.33,20.77 8.33,20.88C8.33,21.3 8.5,21.67 8.77,21.94L9.83,23L16.41,16.42C16.78,16.05 17,15.55 17,15V5A2,2 0 0,0 15,3Z"/></svg>
+            <span>{{ q.dislikes_count ?? 0 }}</span>
+          </span>
+        </div>
+        <div class="obs-passcode-badge">
+          {{ q.passcode }}
+        </div>
       </div>
-      <div class="obs-question-text">
-        {{ activeQuestion.question_text }}
-      </div>
-      <div class="obs-passcode-badge">
-        {{ activeQuestion.passcode }}
-      </div>
-    </div>
+    </TransitionGroup>
   </div>
 
   <!-- ========================================== -->
   <!-- SPECTATOR OR ADMIN FULL APPLICATION VIEW  -->
   <!-- ========================================== -->
-  <div v-else class="app-container">
-    <!-- Header -->
-    <header class="app-header">
-      <div class="brand-section">
-        <div class="logo-container">
-          <!-- Vue Logo -->
-          <svg class="brand-logo" viewBox="0 0 128 128" width="28" height="28">
-            <path fill="#42b883" d="M78.8,10L64,35.4L49.2,10H0l64,110l64-110H78.8z"/>
-            <path fill="#35495e" d="M78.8,10L64,35.4L49.2,10H25.6L64,76.5l38.4-66.5H78.8z"/>
-          </svg>
-          <span class="logo-divider">+</span>
-          <!-- Laravel Logo -->
-          <svg class="brand-logo" viewBox="0 0 128 128" width="28" height="28">
-            <path fill="#ff2d20" d="M96.1,19.3L64,1.1L31.9,19.3V55.6L0,73.8v36.4L32.1,128l32.1-18.2V73.4L96.1,55.2V19.3z M64.2,9.3l21,11.9l-21,11.9l-21-11.9L64.2,9.3z M37.3,27.2l21.3,12.1v24.2L37.3,51.4V27.2z M31.9,59l21,11.9l-21,11.9l-21-11.9L31.9,59z M5.2,81l21.3,12.1v24.2L5.2,105.2V81z M64.2,118.7l-21-11.9l21-11.9l21,11.9L64.2,118.7z M90.8,47.8V23.6l-21.3,12.1v24.2L90.8,47.8z"/>
-          </svg>
-        </div>
-        <div>
-          <h1 class="brand-title">Live Q&A</h1>
-          <p class="brand-subtitle">Vue.js + Laravel API</p>
-        </div>
-      </div>
+  <v-app v-else class="app-background">
+    <!-- Floating Glass Glow Background Bubbles -->
+    <div class="glass-bg-glows">
+      <div class="glow-bubble bubble-1"></div>
+      <div class="glow-bubble bubble-2"></div>
+    </div>
 
-      <!-- Navigation Badges -->
-      <div class="nav-badges">
-        <button 
-          @click="navigateTo('public')" 
-          :class="['nav-btn', { active: currentView === 'public' }]"
-        >
-          Enviar Pergunta
-        </button>
-        <button 
-          @click="navigateTo('admin')" 
-          :class="['nav-btn', { active: currentView === 'admin' }]"
-        >
-          Painel Streamer
-        </button>
-        <a 
-          href="#/obs" 
-          target="_blank" 
-          class="nav-btn"
-        >
-          Tela OBS
-        </a>
-        <button 
-          v-if="isAuthenticated" 
-          @click="logout" 
-          class="nav-btn logout-btn"
-        >
-          Sair
-        </button>
-      </div>
-
-      <!-- Connection Status Card -->
-      <div class="status-card">
-        <div class="status-indicator">
-          <div :class="['status-dot', connectionStatus]"></div>
-        </div>
-        <div class="status-info">
-          <span class="status-label">API Server</span>
-          <span class="status-value" v-if="connectionStatus === 'checking'">Verificando...</span>
-          <span class="status-value" v-else-if="connectionStatus === 'online'">Online</span>
-          <span class="status-value" v-else>Offline</span>
-          <span class="live-badge" v-if="selectedPublicLive && selectedPublicLive.status === 'active' && currentView === 'public'">
-            Live Ativa
-          </span>
-        </div>
-      </div>
-    </header>
-
-    <!-- ========================================== -->
-    <!-- PUBLIC SPECTATOR VIEW                     -->
-    <!-- ========================================== -->
-    <main v-if="currentView === 'public'">
-      <!-- Success Code Screen -->
-      <div v-if="generatedPasscode" class="success-card">
-        <div class="success-icon">
-          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor" style="width: 32px; height: 32px;">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M4.5 12.75l6 6 9-13.5" />
-          </svg>
-        </div>
-        <h2 style="font-size: 1.8rem; font-weight: 800; margin-top: 0; margin-bottom: 0.5rem; color:#fff;">Pergunta Enviada!</h2>
-        <p style="color: var(--text-secondary); max-width: 500px; margin: 0 auto 1.5rem;">
-          Sua pergunta foi cadastrada com sucesso. Copie a sua **Palavra-Passe** abaixo e envie no chat da live para validar sua identidade!
-        </p>
-
-        <div class="passcode-container">
-          <span style="font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted)">Sua Palavra-Passe</span>
-          <span class="passcode-value">{{ generatedPasscode }}</span>
-          <button @click="copyPasscode" class="btn-copy">
-            <span v-if="copySuccess">Copiado!</span>
-            <span v-else>Copiar Código</span>
-            <svg v-if="!copySuccess" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" style="width: 14px; height: 14px;">
-              <path stroke-linecap="round" stroke-linejoin="round" d="M15.75 17.25v3.375c0 .621-.504 1.125-1.125 1.125h-9.75a1.125 1.125h-9.75a1.125 1.125H2.25A1.125 1.125 0 011.125 19.5v-9.75c0-.621.504-1.125 1.125-1.125h9.75c.621 0 1.125.504 1.125 1.125V13.5M9 13.5h3.375c.621 0 1.125.504 1.125 1.125v9.75c0 .621-.504 1.125-1.125 1.125H9.75a1.125 1.125 0 01-1.125-1.125V15M9 13.5H5.625c-.621 0-1.125-.504-1.125-1.125v-9.75c0-.621.504-1.125 1.125-1.125h9.75c.621 0 1.125.504 1.125 1.125V9" />
-            </svg>
-          </button>
-        </div>
-
-        <button @click="resetSuccessScreen" class="btn-secondary" style="margin-top: 1rem;">
-          Enviar outra pergunta
-        </button>
-      </div>
-
-      <!-- Question Submission Form -->
-      <div v-else class="dashboard-grid">
-        <section class="glass-panel">
-          <h2 class="panel-title">
-            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
-              <path stroke-linecap="round" stroke-linejoin="round" d="M7.5 8.25h9s0 0 0 0M7.5 12h9m-9 3.75h3m-3 3.75h12M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
-            </svg>
-            Faça sua Pergunta
-          </h2>
-
-          <!-- No lives at all -->
-          <div v-if="connectionStatus === 'online' && publicLives.length === 0" class="empty-state" style="border: none; background: rgba(255,255,255,0.02); margin-bottom: 2rem;">
-            <svg class="empty-icon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
-              <path stroke-linecap="round" stroke-linejoin="round" d="M12 6.042A8.967 8.967 0 006 3.75c-1.052 0-2.062.18-3 .512v14.25A8.987 8.987 0 016 18c2.305 0 4.408.867 6 2.292m0-14.25a8.966 8.966 0 016-2.292c1.052 0 2.062.18 3 .512v14.25A8.987 8.987 0 0018 18a8.967 8.967 0 00-6 2.292m0-14.25v14.25" />
-            </svg>
-            <h3 class="empty-title">Nenhuma Live Disponível</h3>
-            <p class="empty-text">Não é possível enviar perguntas no momento. O streamer ainda não agendou ou iniciou uma live.</p>
-          </div>
-
-          <!-- Live selection list -->
-          <div v-else-if="!selectedPublicLive" style="display: flex; flex-direction: column; gap: 0.75rem;">
-            <p style="color: var(--text-secondary); font-size: 0.9rem; margin: 0 0 0.5rem;">Selecione a live para enviar sua pergunta:</p>
-            <div
-              v-for="live in publicLives"
-              :key="live.id"
-              class="sidebar-item"
-              @click="selectPublicLive(live)"
-            >
-              <h4 class="sidebar-list-item-title sidebar-item-title" style="margin: 0 0 0.25rem;">{{ live.title }}</h4>
-              <div class="sidebar-item-desc">
-                <span>{{ formatDateTime(live.scheduled_at) }}</span>
-                <span v-if="live.status === 'active'" style="color: var(--success); font-weight: 700; text-transform: uppercase; font-size:0.65rem;">Ao Vivo</span>
-                <span v-else style="color: var(--primary); font-size:0.65rem;">Agendada</span>
-              </div>
-            </div>
-          </div>
-
-          <!-- Question form after selecting a live -->
-          <div v-else>
-            <div style="margin-bottom: 1.5rem; background: rgba(139,92,246,0.05); padding: 1rem; border-radius: 12px; border: 1px solid rgba(139,92,246,0.15)">
-              <span style="font-size: 0.75rem; text-transform: uppercase; color: var(--primary); font-weight: 700; display: block; margin-bottom: 0.2rem;">Live Selecionada</span>
-              <div style="display: flex; justify-content: space-between; align-items: center;">
-                <div>
-                  <span style="font-size: 1.1rem; font-weight: 800; color: #fff; display: block;">{{ selectedPublicLive.title }}</span>
-                  <span style="font-size: 0.8rem; color: var(--text-secondary);">{{ formatDateTime(selectedPublicLive.scheduled_at) }}</span>
-                </div>
-                <button @click="selectedPublicLive = null" class="btn-secondary" style="font-size:0.75rem; padding:0.3rem 0.7rem;">Trocar</button>
+    <v-main class="app-main-content">
+      <v-container class="app-container">
+        <!-- Header -->
+        <v-card class="glass-panel pa-4 mb-6" variant="flat">
+          <div class="d-flex flex-wrap justify-space-between align-center" style="gap: 1.5rem;">
+            <div class="d-flex align-center" style="gap: 1rem;">
+              <v-icon color="primary" size="36">mdi-broadcast</v-icon>
+              <div>
+                <h1 class="brand-title text-h6 font-weight-bold text-white mb-0" style="line-height: 1.2;">livezinha</h1>
+                <p class="brand-subtitle text-caption text-grey-lighten-1 mb-0">Faça suas perguntas!</p>
               </div>
             </div>
 
-            <form @submit.prevent="submitQuestion">
-              <div class="form-group">
-                <label class="form-label" for="user-name">Seu Nome / Apelido</label>
-                <input 
-                  v-model="questionForm.name"
-                  type="text" 
-                  id="user-name" 
-                  class="form-input" 
-                  placeholder="Ex: Carlos Silva"
-                  required
-                  :disabled="isSubmittingQuestion"
-                />
+            <!-- Connection Status and Admin Subtle Access -->
+            <div class="d-flex align-center flex-wrap" style="gap: 0.75rem;">
+              <!-- Subtle Admin Menu / Actions -->
+              <div v-if="currentView === 'admin'" class="d-flex align-center" style="gap: 0.5rem;">
+                <v-btn 
+                  @click="navigateTo('public')" 
+                  color="grey-lighten-3"
+                  variant="outlined"
+                  size="small"
+                  prepend-icon="mdi-arrow-left"
+                >
+                  Voltar
+                </v-btn>
+                <v-btn 
+                  href="#/obs" 
+                  target="_blank" 
+                  color="grey-lighten-3"
+                  variant="outlined"
+                  size="small"
+                  icon="mdi-television-play"
+                  style="width: 28px; height: 28px;"
+                  title="Tela OBS"
+                ></v-btn>
+                <v-btn 
+                  v-if="isAuthenticated" 
+                  @click="logout" 
+                  color="error"
+                  variant="outlined"
+                  size="small"
+                  icon="mdi-logout"
+                  style="width: 28px; height: 28px;"
+                  title="Sair"
+                ></v-btn>
               </div>
-
-              <div class="form-group">
-                <label class="form-label" for="tiktok-handle">TikTok Username (Opcional)</label>
-                <input 
-                  v-model="questionForm.tiktok_handle"
-                  type="text" 
-                  id="tiktok-handle" 
-                  class="form-input" 
-                  placeholder="Ex: @carlostiktok"
-                  :disabled="isSubmittingQuestion"
-                />
+              <div v-else class="d-flex align-center">
+                <v-btn
+                  v-if="isAuthenticated"
+                  @click="navigateTo('admin')"
+                  color="primary"
+                  variant="flat"
+                  size="small"
+                  prepend-icon="mdi-shield-crown-outline"
+                >
+                  Painel Admin
+                </v-btn>
+                <v-btn
+                  v-else
+                  @click="navigateTo('admin')"
+                  icon="mdi-lock-outline"
+                  variant="text"
+                  color="grey-darken-1"
+                  style="width: 28px; height: 28px;"
+                  title="Acesso do Streamer"
+                ></v-btn>
               </div>
+            </div>
+          </div>
+        </v-card>
 
-              <div class="form-group">
-                <label class="form-label" for="question-text">Sua Pergunta</label>
-                <textarea 
-                  v-model="questionForm.question_text"
-                  id="question-text" 
-                  class="form-textarea" 
-                  placeholder="Digite a sua pergunta aqui de forma clara..."
-                  required
-                  maxlength="280"
-                  :disabled="isSubmittingQuestion"
-                ></textarea>
-              </div>
+        <!-- ========================================== -->
+        <!-- PUBLIC SPECTATOR VIEW                     -->
+        <!-- ========================================== -->
+        <div v-if="currentView === 'public'">
+          <!-- Success Code Screen -->
+          <v-card v-if="generatedPasscode" class="mx-auto text-center pa-6 glass-panel" max-width="600">
+            <v-avatar color="success" size="64" class="mb-4">
+              <v-icon size="36" color="white">mdi-check</v-icon>
+            </v-avatar>
+            <h2 class="text-h5 font-weight-bold mb-2 text-white">Pergunta Enviada!</h2>
+            <p class="text-body-2 text-grey-lighten-1 mb-6">
+              Sua pergunta foi cadastrada com sucesso. Copie a sua <strong>Palavra-Passe</strong> abaixo e envie no chat da live para validar sua identidade!
+            </p>
 
-              <div v-if="submitQuestionError" style="color: var(--error); font-size: 0.85rem; margin-bottom: 1rem;">
-                {{ submitQuestionError }}
-              </div>
-
-              <button 
-                type="submit" 
-                class="btn-primary" 
-                :disabled="isSubmittingQuestion || !questionForm.name.trim() || !questionForm.question_text.trim()"
+            <v-card variant="outlined" color="primary" class="pa-4 mb-6 rounded-lg bg-black-opacity" style="border-style: dashed;">
+              <span class="text-caption text-uppercase text-grey-lighten-1 d-block mb-1">Sua Palavra-Passe</span>
+              <span class="text-h4 font-weight-bold text-white d-block py-2" style="letter-spacing: 0.05em;">{{ generatedPasscode }}</span>
+              <v-btn
+                @click="copyPasscode"
+                color="primary"
+                class="mt-2"
+                size="small"
+                :prepend-icon="copySuccess ? 'mdi-check' : 'mdi-content-copy'"
               >
-                <div v-if="isSubmittingQuestion" class="spinner"></div>
-                <span v-else>Enviar Pergunta</span>
-                <svg v-if="!isSubmittingQuestion" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor" style="width:16px; height:16px;">
-                  <path stroke-linecap="round" stroke-linejoin="round" d="M6 12L3.269 3.126A59.768 59.768 0 0121.485 12 59.77 59.77 0 013.27 20.876L5.999 12zm0 0h7.5" />
-                </svg>
-              </button>
-            </form>
+                {{ copySuccess ? 'Copiado!' : 'Copiar Código' }}
+              </v-btn>
+            </v-card>
 
-            <!-- Public Questions List -->
-            <div v-if="publicQuestions.length > 0" style="margin-top: 1.5rem; border-top: 1px solid var(--border-card); padding-top: 1.5rem;">
-              <h3 style="font-size: 1rem; font-weight: 700; color: var(--text-secondary); margin: 0 0 1rem;">
-                Perguntas {{ selectedPublicLive.status === 'active' ? 'sendo exibidas' : 'selecionadas' }}
-              </h3>
-              <div class="questions-list">
-                <div v-for="q in publicQuestions" :key="q.id" class="question-card" style="background: rgba(255,255,255,0.01);">
-                  <div class="question-card-header">
-                    <div class="user-info">
-                      <span class="user-name">{{ q.name }}</span>
+            <v-btn @click="resetSuccessScreen" variant="text" color="grey-lighten-1">
+              Enviar outra pergunta
+            </v-btn>
+          </v-card>
+
+          <!-- Question Submission Form -->
+          <v-row v-else>
+            <v-col cols="12" md="7">
+              <v-card class="glass-panel pa-6 home-form-card">
+                <v-card-title class="d-flex align-center px-0 pb-4 text-white">
+                  <v-icon color="primary" class="mr-2">mdi-message-text-outline</v-icon>
+                  Faça sua Pergunta
+                </v-card-title>
+
+                <!-- No lives at all -->
+                <v-card
+                  v-if="connectionStatus === 'online' && publicLives.length === 0"
+                  class="text-center pa-6 bg-transparent"
+                  variant="flat"
+                >
+                  <v-icon size="48" color="grey-lighten-1" class="mb-3">mdi-video-off-outline</v-icon>
+                  <h3 class="text-h6 text-white mb-1">Nenhuma Live Disponível</h3>
+                  <p class="text-body-2 text-grey-lighten-1">
+                    Não é possível enviar perguntas no momento. O streamer ainda não agendou ou iniciou uma live.
+                  </p>
+                </v-card>
+
+                <!-- Live selection list -->
+                <div v-else-if="!selectedPublicLive">
+                  <p class="text-body-2 text-grey-lighten-1 mb-3">Selecione a live para enviar sua pergunta:</p>
+                  <v-list class="bg-transparent pa-0">
+                    <v-list-item
+                      v-for="live in publicLives"
+                      :key="live.id"
+                      class="glass-panel mb-2"
+                      @click="selectPublicLive(live)"
+                      link
+                      style="border: 1px solid rgba(255,255,255,0.05);"
+                    >
+                      <v-list-item-title class="text-white font-weight-bold">{{ live.title }}</v-list-item-title>
+                      <v-list-item-subtitle class="text-grey-lighten-1">
+                        {{ formatDateTime(live.scheduled_at) }}
+                      </v-list-item-subtitle>
+                      <template v-slot:append>
+                        <v-chip
+                          size="small"
+                          :color="live.status === 'active' ? 'error' : 'primary'"
+                          variant="flat"
+                        >
+                          {{ live.status === 'active' ? 'Ao Vivo' : 'Agendada' }}
+                        </v-chip>
+                      </template>
+                    </v-list-item>
+                  </v-list>
+                </div>
+
+                <!-- Question form after selecting a live -->
+                <div v-else>
+                  <v-alert
+                    color="primary"
+                    variant="tonal"
+                    class="mb-4 pa-4 rounded-lg"
+                    border="start"
+                  >
+                    <div class="d-flex justify-space-between align-center">
+                      <div>
+                        <span class="text-caption text-uppercase text-grey-lighten-1 d-block font-weight-bold">Live Selecionada</span>
+                        <span class="text-subtitle-1 text-white font-weight-bold d-block">{{ selectedPublicLive.title }}</span>
+                        <span class="text-caption text-grey-lighten-2">{{ formatDateTime(selectedPublicLive.scheduled_at) }}</span>
+                      </div>
+                      <v-btn size="small" variant="outlined" color="white" @click="selectedPublicLive = null">
+                        Trocar
+                      </v-btn>
+                    </div>
+                  </v-alert>
+
+                  <v-form @submit.prevent="submitQuestion">
+                    <v-text-field
+                      v-model="questionForm.name"
+                      label="Seu Nome / Apelido"
+                      placeholder="Ex: Carlos Silva"
+                      variant="outlined"
+                      required
+                      :disabled="isSubmittingQuestion"
+                      class="mb-2"
+                      density="comfortable"
+                    ></v-text-field>
+
+                    <v-text-field
+                      v-model="questionForm.tiktok_handle"
+                      label="TikTok Username (Opcional)"
+                      placeholder="Ex: @carlostiktok"
+                      variant="outlined"
+                      :disabled="isSubmittingQuestion"
+                      class="mb-2"
+                      density="comfortable"
+                      prepend-inner-icon="mdi-music-note"
+                    ></v-text-field>
+
+                    <v-textarea
+                      v-model="questionForm.question_text"
+                      label="Sua Pergunta"
+                      placeholder="Digite a sua pergunta aqui de forma clara..."
+                      variant="outlined"
+                      required
+                      maxlength="280"
+                      counter
+                      rows="3"
+                      :disabled="isSubmittingQuestion"
+                      class="mb-2"
+                      density="comfortable"
+                    ></v-textarea>
+
+                    <div v-if="submitQuestionError" class="text-error text-caption mb-3">
+                      {{ submitQuestionError }}
+                    </div>
+
+                    <v-btn
+                      type="submit"
+                      color="primary"
+                      block
+                      size="large"
+                      :loading="isSubmittingQuestion"
+                      :disabled="!questionForm.name.trim() || !questionForm.question_text.trim()"
+                      append-icon="mdi-send"
+                    >
+                      Enviar Pergunta
+                    </v-btn>
+                  </v-form>
+
+                  <!-- Public Questions List -->
+                  <div v-if="publicQuestions.length > 0" class="mt-6">
+                    <h3 class="text-subtitle-2 font-weight-bold text-grey-lighten-1 mb-3">
+                      Perguntas {{ selectedPublicLive.status === 'active' ? 'sendo exibidas' : 'selecionadas' }}
+                    </h3>
+                    <div class="d-flex flex-column" style="gap: 0.5rem;">
+                      <v-card
+                        v-for="q in publicQuestions"
+                        :key="q.id"
+                        class="pa-4 rounded-lg bg-black-opacity"
+                        variant="outlined"
+                        style="border-color: rgba(255,255,255,0.05);"
+                      >
+                        <div class="d-flex align-center mb-1">
+                          <span class="text-subtitle-2 font-weight-bold text-white">{{ q.name }}</span>
+                        </div>
+                        <p class="text-body-2 text-grey-lighten-2 mb-2">{{ q.question_text }}</p>
+                        <div class="d-flex align-center" style="gap: 0.75rem;">
+                          <v-btn
+                            size="x-small"
+                            :color="getUserVote(q.id) === 'like' ? 'success' : 'grey-darken-1'"
+                            variant="text"
+                            :loading="isVotingQuestion === q.id"
+                            :disabled="isVotingQuestion !== null"
+                            @click="voteQuestion(q.id, 'like')"
+                            class="pa-1"
+                            style="min-width: 0;"
+                          >
+                            <v-icon size="small" class="mr-1">mdi-thumb-up</v-icon>
+                            <span class="text-caption">{{ q.likes_count ?? 0 }}</span>
+                          </v-btn>
+                          <v-btn
+                            size="x-small"
+                            :color="getUserVote(q.id) === 'dislike' ? 'error' : 'grey-darken-1'"
+                            variant="text"
+                            :loading="isVotingQuestion === q.id"
+                            :disabled="isVotingQuestion !== null"
+                            @click="voteQuestion(q.id, 'dislike')"
+                            class="pa-1"
+                            style="min-width: 0;"
+                          >
+                            <v-icon size="small" class="mr-1">mdi-thumb-down</v-icon>
+                            <span class="text-caption">{{ q.dislikes_count ?? 0 }}</span>
+                          </v-btn>
+                        </div>
+                      </v-card>
                     </div>
                   </div>
-                  <p class="question-text-content">{{ q.question_text }}</p>
                 </div>
-              </div>
-            </div>
-          </div>
-        </section>
+              </v-card>
+            </v-col>
 
-        <!-- Instructions Card -->
-        <section class="glass-panel" style="display: flex; flex-direction: column; justify-content: center; background: radial-gradient(circle at 0% 0%, rgba(139, 92, 246, 0.08) 0%, rgba(0,0,0,0) 70%), var(--bg-card);">
-          <h2 style="font-size: 1.5rem; font-weight: 800; color: #fff; margin-top: 0; margin-bottom: 1rem;">Como Funciona?</h2>
-          
-          <div style="display: flex; flex-direction: column; gap: 1.5rem;">
-            <div style="display: flex; gap: 1rem; align-items: flex-start;">
-              <span style="font-size: 1rem; font-weight: 800; background: var(--primary-gradient); color: #fff; width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center; flex-shrink: 0;">1</span>
-              <div>
-                <h4 style="margin: 0 0 0.25rem; font-weight: 700; color: #fff;">Escreva sua Pergunta</h4>
-                <p style="margin: 0; font-size: 0.85rem; color: var(--text-secondary);">Cadastre seu nome, TikTok (se tiver) e sua dúvida relevante para o streamer.</p>
-              </div>
-            </div>
+            <!-- Instructions Column -->
+            <v-col cols="12" md="5">
+              <v-card class="glass-panel pa-6 d-flex flex-column justify-center fill-height" style="background: radial-gradient(circle at 0% 0%, rgba(139, 92, 246, 0.08) 0%, rgba(0,0,0,0) 70%), rgba(15, 17, 28, 0.7);">
+                <h2 class="text-h5 font-weight-bold text-white mb-4">Como Funciona?</h2>
+                
+                <div class="d-flex flex-column" style="gap: 1.5rem;">
+                  <div class="d-flex align-start">
+                    <v-avatar color="primary" size="32" class="mr-3 text-white font-weight-bold">1</v-avatar>
+                    <div>
+                      <h4 class="text-subtitle-2 font-weight-bold text-white">Escreva sua Pergunta</h4>
+                      <p class="text-caption text-grey-lighten-1 mb-0">Cadastre seu nome, TikTok (se tiver) e sua dúvida relevante para o streamer.</p>
+                    </div>
+                  </div>
 
-            <div style="display: flex; gap: 1rem; align-items: flex-start;">
-              <span style="font-size: 1rem; font-weight: 800; background: var(--primary-gradient); color: #fff; width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center; flex-shrink: 0;">2</span>
-              <div>
-                <h4 style="margin: 0 0 0.25rem; font-weight: 700; color: #fff;">Gere a Palavra-Passe</h4>
-                <p style="margin: 0; font-size: 0.85rem; color: var(--text-secondary);">Ao concluir o cadastro, guarde o código em português (ex: **`pipoca-doce`**) que aparece na tela.</p>
-              </div>
-            </div>
+                  <div class="d-flex align-start">
+                    <v-avatar color="primary" size="32" class="mr-3 text-white font-weight-bold">2</v-avatar>
+                    <div>
+                      <h4 class="text-subtitle-2 font-weight-bold text-white">Gere a Palavra-Passe</h4>
+                      <p class="text-caption text-grey-lighten-1 mb-0">Ao concluir o cadastro, guarde o código em português (ex: <strong>gato-azul-42</strong>) que aparece na tela.</p>
+                    </div>
+                  </div>
 
-            <div style="display: flex; gap: 1rem; align-items: flex-start;">
-              <span style="font-size: 1rem; font-weight: 800; background: var(--primary-gradient); color: #fff; width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center; flex-shrink: 0;">3</span>
-              <div>
-                <h4 style="margin: 0 0 0.25rem; font-weight: 700; color: #fff;">Valide no Chat da Live</h4>
-                <p style="margin: 0; font-size: 0.85rem; color: var(--text-secondary);">Quando o streamer chamar sua pergunta, digite a Palavra-Passe no chat. Assim provamos que você está assistindo!</p>
-              </div>
-            </div>
+                  <div class="d-flex align-start">
+                    <v-avatar color="primary" size="32" class="mr-3 text-white font-weight-bold">3</v-avatar>
+                    <div>
+                      <h4 class="text-subtitle-2 font-weight-bold text-white">Valide no Chat da Live</h4>
+                      <p class="text-caption text-grey-lighten-1 mb-0">Quando o streamer chamar sua pergunta, digite a Palavra-Passe no chat. Assim provamos que você está assistindo!</p>
+                    </div>
+                  </div>
 
-            <div style="display: flex; gap: 1rem; align-items: flex-start;">
-              <span style="font-size: 1rem; font-weight: 800; background: var(--accent-gradient); color: #fff; width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center; flex-shrink: 0;">🎬</span>
-              <div>
-                <h4 style="margin: 0 0 0.25rem; font-weight: 700; color: #fff;">Cortes & Destaques</h4>
-                <p style="margin: 0; font-size: 0.85rem; color: var(--text-secondary);">Deixando seu TikTok, o streamer poderá fazer um corte da resposta e marcar seu perfil oficial na rede social!</p>
-              </div>
-            </div>
-          </div>
-        </section>
-      </div>
-    </main>
-
-    <!-- ========================================== -->
-    <!-- LOGIN VIEW                               -->
-    <!-- ========================================== -->
-    <main v-if="currentView === 'admin' && !isAuthenticated" class="login-container">
-      <section class="glass-panel login-card">
-        <div class="login-header">
-          <svg class="brand-logo" viewBox="0 0 128 128" width="40" height="40">
-            <path fill="#ff2d20" d="M96.1,19.3L64,1.1L31.9,19.3V55.6L0,73.8v36.4L32.1,128l32.1-18.2V73.4L96.1,55.2V19.3z M64.2,9.3l21,11.9l-21,11.9l-21-11.9L64.2,9.3z M37.3,27.2l21.3,12.1v24.2L37.3,51.4V27.2z M31.9,59l21,11.9l-21,11.9l-21-11.9L31.9,59z M5.2,81l21.3,12.1v24.2L5.2,105.2V81z M64.2,118.7l-21-11.9l21-11.9l21,11.9L64.2,118.7z M90.8,47.8V23.6l-21.3,12.1v24.2L90.8,47.8z"/>
-          </svg>
-          <h2>Acesso do Streamer</h2>
-          <p>Faça login para gerenciar lives e perguntas.</p>
-        </div>
-        <form @submit.prevent="login">
-          <div class="form-group">
-            <label class="form-label" for="login-email">E-mail</label>
-            <input
-              v-model="loginForm.email"
-              type="email"
-              id="login-email"
-              class="form-input"
-              placeholder="seu@email.com"
-              required
-              :disabled="isLoggingIn"
-            />
-          </div>
-          <div class="form-group">
-            <label class="form-label" for="login-password">Senha</label>
-            <input
-              v-model="loginForm.password"
-              type="password"
-              id="login-password"
-              class="form-input"
-              placeholder="••••••"
-              required
-              :disabled="isLoggingIn"
-            />
-          </div>
-          <div v-if="loginError" class="login-error">{{ loginError }}</div>
-          <button type="submit" class="btn-primary login-btn" :disabled="isLoggingIn">
-            <div v-if="isLoggingIn" class="spinner"></div>
-            <span v-else>Entrar</span>
-          </button>
-        </form>
-      </section>
-    </main>
-
-    <!-- ========================================== -->
-    <!-- STREAMER ADMIN VIEW                       -->
-    <!-- ========================================== -->
-    <main v-if="currentView === 'admin' && isAuthenticated" class="admin-grid">
-      <!-- Admin Sidebar (Lives management) -->
-      <aside class="glass-panel" style="padding: 1.5rem;">
-        <h3 style="font-size: 1.15rem; font-weight: 800; margin-top: 0; margin-bottom: 1.25rem; color:#fff;">Agendar Nova Live</h3>
-        <form @submit.prevent="createLive" style="margin-bottom: 2rem; border-bottom: 1px solid var(--border-card); padding-bottom: 1.5rem;">
-          <div class="form-group">
-            <label class="form-label" style="font-size: 0.75rem;">Título da Live</label>
-            <input 
-              v-model="newLiveForm.title"
-              type="text" 
-              class="form-input" 
-              placeholder="Ex: Live de Sexta" 
-              required
-            />
-          </div>
-          <div class="form-group">
-            <label class="form-label" style="font-size: 0.75rem;">Data e Hora</label>
-            <DatePicker
-              v-model="newLiveForm.scheduled_at"
-              placeholder="Selecione data e hora"
-            />
-          </div>
-          <button type="submit" class="btn-primary" style="padding: 0.7rem 1.2rem; font-size:0.85rem;" :disabled="isCreatingLive">
-            <span v-if="isCreatingLive">Criando...</span>
-            <span v-else>Agendar Live</span>
-          </button>
-        </form>
-
-        <h3 style="font-size: 1.15rem; font-weight: 800; margin-top: 0; margin-bottom: 1rem; color:#fff;">Suas Lives</h3>
-        <div class="sidebar-list">
-          <div 
-            v-for="live in lives" 
-            :key="live.id"
-            :class="['sidebar-item', { active: selectedLive && selectedLive.id === live.id }]"
-            @click="selectLive(live)"
-          >
-            <h4 class="sidebar-list-item-title sidebar-item-title">{{ live.title }}</h4>
-            <div class="sidebar-item-desc">
-              <span>{{ formatDateTime(live.scheduled_at) }}</span>
-              <span v-if="live.status === 'active'" style="color: var(--success); font-weight: 700; text-transform: uppercase; font-size:0.65rem;">Ativa</span>
-              <span v-else-if="live.status === 'finished'" style="color: var(--text-muted); font-size:0.65rem;">Finalizada</span>
-              <span v-else style="color: var(--primary); font-size:0.65rem;">Agendada</span>
-            </div>
-          </div>
-          <div v-if="lives.length === 0" style="color: var(--text-muted); text-align: center; font-size:0.85rem; padding: 2rem 0;">
-            Nenhuma live agendada.
-          </div>
-        </div>
-      </aside>
-
-      <!-- Main Moderation Panel -->
-      <section class="glass-panel">
-        <!-- Live Selected Header -->
-        <div v-if="selectedLive" style="border-bottom: 1px solid var(--border-card); padding-bottom: 1.5rem; margin-bottom: 1.5rem;">
-          <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 1rem;">
-            <div>
-              <span style="font-size: 0.75rem; text-transform: uppercase; color: var(--text-muted); font-weight: 700; letter-spacing: 0.05em;">Live Selecionada</span>
-              <h2 style="font-size: 1.6rem; font-weight: 800; color: #fff; margin: 0.15rem 0;">{{ selectedLive.title }}</h2>
-              <p style="margin: 0; font-size: 0.85rem; color: var(--text-secondary);">Agendada: {{ formatDateTime(selectedLive.scheduled_at) }}</p>
-            </div>
-            
-            <div style="display: flex; gap: 0.5rem;">
-              <button 
-                v-if="selectedLive.status !== 'active'" 
-                @click="toggleLiveStatus('active')"
-                class="btn-secondary" 
-                style="border-color: var(--success); color: var(--success); background: rgba(16, 185, 129, 0.05);"
-              >
-                🔴 Iniciar Live
-              </button>
-              <button 
-                v-if="selectedLive.status === 'active'" 
-                @click="toggleLiveStatus('finished')"
-                class="btn-secondary" 
-                style="border-color: var(--text-muted); color: var(--text-secondary);"
-              >
-                ⏹️ Encerrar Live
-              </button>
-              <button 
-                @click="deleteLive(selectedLive.id)"
-                class="btn-secondary" 
-                style="border-color: var(--error); color: var(--error); background: rgba(239, 68, 68, 0.05);"
-              >
-                Excluir
-              </button>
-            </div>
-          </div>
-        </div>
-
-        <!-- Filter Bar -->
-        <div v-if="selectedLive" class="filter-bar">
-          <button @click="selectedFilter = 'all'" :class="['filter-btn', { active: selectedFilter === 'all' }]">
-            Todas ({{ adminQuestions.length }})
-          </button>
-          <button @click="selectedFilter = 'pending'" :class="['filter-btn pending', { active: selectedFilter === 'pending' }]">
-            Pendentes ({{ adminQuestions.filter(q => q.status === 'pending').length }})
-          </button>
-          <button @click="selectedFilter = 'approved'" :class="['filter-btn approved', { active: selectedFilter === 'approved' }]">
-            Aprovadas ({{ adminQuestions.filter(q => q.status === 'approved').length }})
-          </button>
-          <button @click="selectedFilter = 'active'" :class="['filter-btn active', { active: selectedFilter === 'active' }]">
-            Na Tela ({{ adminQuestions.filter(q => q.status === 'active').length }})
-          </button>
-          <button @click="selectedFilter = 'archived'" :class="['filter-btn archived', { active: selectedFilter === 'archived' }]">
-            Respondidas ({{ adminQuestions.filter(q => q.status === 'archived').length }})
-          </button>
-        </div>
-
-        <!-- Admin Questions List -->
-        <div v-if="selectedLive">
-          <div v-if="filteredQuestions.length > 0" class="questions-list">
-            <div 
-              v-for="q in filteredQuestions" 
-              :key="q.id" 
-              :class="['question-card', q.status]"
-            >
-              <div class="question-card-header">
-                <div class="user-info">
-                  <span class="user-name">
-                    {{ q.name }}
-                    <a 
-                      v-if="q.tiktok_handle" 
-                      :href="'https://www.tiktok.com/' + q.tiktok_handle" 
-                      target="_blank" 
-                      class="tiktok-badge"
-                    >
-                      <svg viewBox="0 0 448 512">
-                        <path d="M448,209.91a210.06,210.06,0,0,1-122.77-39.25V349.38A162.55,162.55,0,1,1,185,188.31c8.08,0,15.79.62,23.36,1.88l.1,0H208.5v72.33l-.1,0A89.92,89.92,0,1,0,248.8,349.38V0h79.52c1.7,46.7,29.9,85.67,69.57,105.51v74.65c-20.9-9-39.6-22.9-54.8-40.4V209.91C375.4,209.91,413.4,209.91,448,209.91Z"/>
-                      </svg>
-                      {{ q.tiktok_handle }}
-                    </a>
-                  </span>
-                </div>
-                <div class="question-passcode">
-                  Palavra-Passe: <strong>{{ q.passcode }}</strong>
-                </div>
-              </div>
-
-              <p class="question-text-content">{{ q.question_text }}</p>
-
-              <div class="question-actions">
-                <!-- Action buttons -->
-                <div class="action-buttons">
-                  <button 
-                    v-if="q.status === 'pending'" 
-                    @click="updateQuestionStatus(q.id, 'approved')"
-                    class="action-btn-small approve"
-                  >
-                    Aprovar
-                  </button>
-                  <button 
-                    v-if="q.status === 'approved' || q.status === 'pending'" 
-                    @click="updateQuestionStatus(q.id, 'active')"
-                    class="action-btn-small screen"
-                  >
-                    Exibir na Tela (OBS)
-                  </button>
-                  <button 
-                    v-if="q.status === 'active'" 
-                    @click="updateQuestionStatus(q.id, 'archived')"
-                    class="action-btn-small archive"
-                  >
-                    Marcar como Respondida
-                  </button>
-                  <button 
-                    v-if="q.status !== 'archived' && q.status !== 'pending'"
-                    @click="updateQuestionStatus(q.id, 'archived')"
-                    class="action-btn-small archive"
-                  >
-                    Arquivar
-                  </button>
-                  <button 
-                    v-if="q.status === 'archived'" 
-                    @click="updateQuestionStatus(q.id, 'approved')"
-                    class="action-btn-small approve"
-                  >
-                    Desarquivar
-                  </button>
-                  <button 
-                    @click="deleteQuestion(q.id)"
-                    class="btn-delete"
-                    style="padding: 0.35rem 0.5rem;"
-                    title="Excluir Pergunta"
-                  >
-                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" style="width: 14px; height: 14px;">
-                      <path stroke-linecap="round" stroke-linejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0" />
-                    </svg>
-                  </button>
-                  <button
-                    @click="toggleQuestionHidden(q)"
-                    :class="['action-btn-small', q.is_hidden ? 'approve' : 'archive']"
-                    :title="q.is_hidden ? 'Mostrar ao público' : 'Ocultar do público'"
-                  >
-                    {{ q.is_hidden ? 'Mostrar' : 'Ocultar' }}
-                  </button>
-                </div>
-
-                <!-- TikTok clip toggle -->
-                <div 
-                  v-if="q.tiktok_handle"
-                  @click="toggleQuestionTagStatus(q)"
-                  :class="['switch-container', { active: q.is_tagged }]"
-                  title="Marque quando criar o corte e marcar a pessoa no TikTok"
-                >
-                  <span>Corte Criado / Marcado</span>
-                  <div class="switch-track">
-                    <div class="switch-thumb"></div>
+                  <div class="d-flex align-start">
+                    <v-avatar color="accent" size="32" class="mr-3 text-white font-weight-bold">🎬</v-avatar>
+                    <div>
+                      <h4 class="text-subtitle-2 font-weight-bold text-white">Cortes & Destaques</h4>
+                      <p class="text-caption text-grey-lighten-1 mb-0">Deixando seu TikTok, o streamer poderá fazer um corte da resposta e marcar seu perfil oficial na rede social!</p>
+                    </div>
                   </div>
                 </div>
-              </div>
-            </div>
-          </div>
+              </v-card>
+            </v-col>
+          </v-row>
+        </div>
 
-          <div v-else class="empty-state">
-            <svg class="empty-icon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
-              <path stroke-linecap="round" stroke-linejoin="round" d="M9.879 7.519c1.171-1.025 3.071-1.025 4.242 0 1.172 1.025 1.172 2.687 0 3.712-.203.179-.43.326-.67.442-.745.361-1.45.999-1.45 1.827v.75M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-9 5.25h.008v.008H12v-.008z" />
+        <!-- ========================================== -->
+        <!-- LOGIN VIEW                               -->
+        <!-- ========================================== -->
+        <v-card v-if="currentView === 'admin' && !isAuthenticated" class="mx-auto glass-panel pa-6 text-center" max-width="450">
+          <div class="d-flex justify-center mb-4">
+            <svg class="brand-logo" viewBox="0 0 128 128" width="48" height="48">
+              <path fill="#ff2d20" d="M96.1,19.3L64,1.1L31.9,19.3V55.6L0,73.8v36.4L32.1,128l32.1-18.2V73.4L96.1,55.2V19.3z M64.2,9.3l21,11.9l-21,11.9l-21-11.9L64.2,9.3z M37.3,27.2l21.3,12.1v24.2L37.3,51.4V27.2z M31.9,59l21,11.9l-21,11.9l-21-11.9L31.9,59z M5.2,81l21.3,12.1v24.2L5.2,105.2V81z M64.2,118.7l-21-11.9l21-11.9l21,11.9L64.2,118.7z M90.8,47.8V23.6l-21.3,12.1v24.2L90.8,47.8z"/>
             </svg>
-            <h3 class="empty-title">Nenhuma Pergunta</h3>
-            <p class="empty-text">Nenhuma pergunta encontrada com este filtro para esta live.</p>
           </div>
-        </div>
+          <h2 class="text-h5 font-weight-bold text-white mb-1">Acesso do Streamer</h2>
+          <p class="text-body-2 text-grey-lighten-1 mb-6">Faça login para gerenciar lives e perguntas.</p>
+          
+          <v-form @submit.prevent="login">
+            <v-text-field
+              v-model="loginForm.email"
+              label="E-mail"
+              type="email"
+              placeholder="seu@email.com"
+              variant="outlined"
+              required
+              :disabled="isLoggingIn"
+              class="mb-2"
+              density="comfortable"
+              prepend-inner-icon="mdi-email"
+            ></v-text-field>
 
-        <div v-else class="empty-state" style="padding: 5rem 2rem;">
-          <svg class="empty-icon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-          </svg>
-          <h3 class="empty-title">Nenhuma Live Selecionada</h3>
-          <p class="empty-text">Selecione ou crie uma live na barra lateral esquerda para gerenciar as perguntas.</p>
-        </div>
-      </section>
-    </main>
-  </div>
+            <v-text-field
+              v-model="loginForm.password"
+              label="Senha"
+              type="password"
+              placeholder="••••••"
+              variant="outlined"
+              required
+              :disabled="isLoggingIn"
+              class="mb-4"
+              density="comfortable"
+              prepend-inner-icon="mdi-lock"
+            ></v-text-field>
+
+            <div v-if="loginError" class="text-error text-caption mb-3">{{ loginError }}</div>
+
+            <v-btn
+              type="submit"
+              color="primary"
+              block
+              size="large"
+              :loading="isLoggingIn"
+            >
+              Entrar
+            </v-btn>
+          </v-form>
+        </v-card>
+
+        <!-- ========================================== -->
+        <!-- STREAMER ADMIN VIEW                       -->
+        <!-- ========================================== -->
+        <v-row v-if="currentView === 'admin' && isAuthenticated">
+          <!-- Admin Sidebar (Lives management) -->
+          <v-col cols="12" md="4" class="order-last order-md-first">
+            <v-card class="glass-panel pa-4">
+              <h3 class="text-subtitle-1 font-weight-bold text-white mb-3">Agendar Nova Live</h3>
+              <v-form @submit.prevent="createLive" class="pb-4 mb-4" style="border-bottom: 1px solid rgba(255,255,255,0.08);">
+                <v-text-field
+                  v-model="newLiveForm.title"
+                  label="Título da Live"
+                  placeholder="Ex: Live de Sexta"
+                  variant="outlined"
+                  required
+                  density="compact"
+                  class="mb-3"
+                ></v-text-field>
+                
+                <div class="mb-3">
+                  <span class="text-caption text-grey-lighten-1 d-block mb-1">Data e Hora</span>
+                  <DatePicker
+                    v-model="newLiveForm.scheduled_at"
+                    placeholder="Selecione data e hora"
+                  />
+                </div>
+
+                <v-btn
+                  type="submit"
+                  color="primary"
+                  block
+                  size="small"
+                  :loading="isCreatingLive"
+                >
+                  Agendar Live
+                </v-btn>
+              </v-form>
+
+              <h3 class="text-subtitle-1 font-weight-bold text-white mb-2">Suas Lives</h3>
+              <v-list class="bg-transparent pa-0 overflow-y-auto" style="max-height: 400px; gap: 0.5rem; display: flex; flex-direction: column;">
+                <v-list-item
+                  v-for="live in lives"
+                  :key="live.id"
+                  :active="selectedLive?.id === live.id"
+                  class="glass-panel"
+                  style="border: 1px solid rgba(255, 255, 255, 0.05);"
+                  @click="selectLive(live)"
+                  link
+                >
+                  <v-list-item-title class="text-white font-weight-bold text-body-2">{{ live.title }}</v-list-item-title>
+                  <v-list-item-subtitle class="text-caption text-grey-lighten-1">
+                    {{ formatDateTime(live.scheduled_at) }}
+                  </v-list-item-subtitle>
+                  <template v-slot:append>
+                    <v-chip
+                      size="x-small"
+                      :color="live.status === 'active' ? 'error' : live.status === 'finished' ? 'grey' : 'primary'"
+                      variant="flat"
+                    >
+                      {{ live.status === 'active' ? 'Ativa' : live.status === 'finished' ? 'Finalizada' : 'Agendada' }}
+                    </v-chip>
+                  </template>
+                </v-list-item>
+                <div v-if="lives.length === 0" class="text-center text-caption text-grey-lighten-1 py-4">
+                  Nenhuma live agendada.
+                </div>
+              </v-list>
+            </v-card>
+          </v-col>
+
+          <!-- Main Moderation Panel -->
+          <v-col cols="12" md="8" class="order-first order-md-last">
+            <v-card class="glass-panel pa-6">
+              <!-- Live Selected Header -->
+              <div v-if="selectedLive" class="pb-4 mb-4" style="border-bottom: 1px solid rgba(255,255,255,0.08);">
+                <v-row align="center" justify="space-between">
+                  <v-col cols="12" sm="7">
+                    <span class="text-caption text-uppercase text-grey-lighten-1 font-weight-bold">Live Selecionada</span>
+                    <h2 class="text-h5 font-weight-bold text-white my-1">{{ selectedLive.title }}</h2>
+                    <p class="text-caption text-grey-lighten-2 mb-0">Agendada: {{ formatDateTime(selectedLive.scheduled_at) }}</p>
+                  </v-col>
+                  <v-col cols="12" sm="5" class="d-flex justify-sm-end" style="gap: 0.5rem;">
+                    <v-btn
+                      v-if="selectedLive.status !== 'active'"
+                      color="success"
+                      size="small"
+                      variant="flat"
+                      @click="toggleLiveStatus('active')"
+                    >
+                      🔴 Iniciar Live
+                    </v-btn>
+                    <v-btn
+                      v-if="selectedLive.status === 'active'"
+                      color="grey-lighten-1"
+                      size="small"
+                      variant="flat"
+                      @click="toggleLiveStatus('finished')"
+                    >
+                      ⏹️ Encerrar Live
+                    </v-btn>
+                    <v-btn
+                      color="error"
+                      size="small"
+                      variant="outlined"
+                      @click="deleteLive(selectedLive.id)"
+                    >
+                      Excluir
+                    </v-btn>
+                  </v-col>
+                </v-row>
+              </div>
+
+              <!-- Filter Bar -->
+              <div v-if="selectedLive" class="d-flex flex-wrap mb-4" style="gap: 0.5rem;">
+                <v-btn
+                  size="x-small"
+                  :variant="selectedFilter === 'all' ? 'flat' : 'outlined'"
+                  color="white"
+                  @click="selectedFilter = 'all'"
+                >
+                  Todas ({{ adminQuestions.length }})
+                </v-btn>
+                <v-btn
+                  size="x-small"
+                  :variant="selectedFilter === 'pending' ? 'flat' : 'outlined'"
+                  color="warning"
+                  @click="selectedFilter = 'pending'"
+                >
+                  Pendentes ({{ adminQuestions.filter(q => q.status === 'pending').length }})
+                </v-btn>
+                <v-btn
+                  size="x-small"
+                  :variant="selectedFilter === 'approved' ? 'flat' : 'outlined'"
+                  color="primary"
+                  @click="selectedFilter = 'approved'"
+                >
+                  Aprovadas ({{ adminQuestions.filter(q => q.status === 'approved').length }})
+                </v-btn>
+                <v-btn
+                  size="x-small"
+                  :variant="selectedFilter === 'active' ? 'flat' : 'outlined'"
+                  color="error"
+                  @click="selectedFilter = 'active'"
+                >
+                  Na Tela ({{ adminQuestions.filter(q => q.status === 'active').length }})
+                </v-btn>
+                <v-btn
+                  size="x-small"
+                  :variant="selectedFilter === 'archived' ? 'flat' : 'outlined'"
+                  color="grey"
+                  @click="selectedFilter = 'archived'"
+                >
+                  Respondidas ({{ adminQuestions.filter(q => q.status === 'archived').length }})
+                </v-btn>
+              </div>
+
+              <!-- Admin Questions List -->
+              <div v-if="selectedLive">
+                <div v-if="filteredQuestions.length > 0" class="d-flex flex-column" style="gap: 0.75rem;">
+                  <v-card
+                    v-for="q in filteredQuestions"
+                    :key="q.id"
+                    :class="['pa-4 border-left-3', q.status]"
+                    variant="outlined"
+                    style="background: rgba(255, 255, 255, 0.02); border-color: rgba(255,255,255,0.05);"
+                  >
+                    <div class="d-flex flex-wrap justify-space-between align-center mb-2" style="gap: 0.5rem;">
+                      <div>
+                        <span class="text-subtitle-2 font-weight-bold text-white mr-2">{{ q.name }}</span>
+                        <v-chip
+                          v-if="q.tiktok_handle"
+                          size="x-small"
+                          color="accent"
+                          variant="flat"
+                          :href="'https://www.tiktok.com/' + q.tiktok_handle"
+                          target="_blank"
+                          link
+                          prepend-icon="mdi-music-note"
+                        >
+                          {{ q.tiktok_handle }}
+                        </v-chip>
+                      </div>
+                      <div class="text-caption text-grey-lighten-1">
+                        Palavra-Passe: <strong class="text-white font-weight-bold">{{ q.passcode }}</strong>
+                      </div>
+                    </div>
+
+                    <p class="text-body-2 text-grey-lighten-2 mb-2">{{ q.question_text }}</p>
+ 
+                    <!-- Vote Counts -->
+                    <div class="mt-1 mb-3 d-flex align-center" style="gap: 1rem; border-top: 1px solid rgba(255,255,255,0.03); padding-top: 0.5rem;">
+                      <span>
+                        <v-icon size="x-small" color="success" class="mr-1">mdi-thumb-up</v-icon>
+                        <strong class="text-white text-caption">{{ q.likes_count ?? 0 }}</strong>
+                      </span>
+                      <span>
+                        <v-icon size="x-small" color="error" class="mr-1">mdi-thumb-down</v-icon>
+                        <strong class="text-white text-caption">{{ q.dislikes_count ?? 0 }}</strong>
+                      </span>
+                    </div>
+
+                    <!-- Timing Information -->
+                    <div v-if="q.displayed_at" class="mt-1 mb-3 text-caption text-grey-lighten-1 d-flex flex-wrap align-center" style="gap: 1rem; border-top: 1px solid rgba(255,255,255,0.03); padding-top: 0.5rem;">
+                      <span v-if="selectedLive?.started_at">
+                        <v-icon size="x-small" class="mr-1">mdi-play-circle-outline</v-icon>
+                        Início: <strong class="text-white">{{ formatRelativeTime(q.displayed_at, selectedLive.started_at) }}</strong>
+                      </span>
+                      <span v-if="q.removed_at && selectedLive?.started_at">
+                        <v-icon size="x-small" class="mr-1">mdi-stop-circle-outline</v-icon>
+                        Fim: <strong class="text-white">{{ formatRelativeTime(q.removed_at, selectedLive.started_at) }}</strong>
+                      </span>
+                      <span>
+                        <v-icon size="x-small" class="mr-1">mdi-clock-outline</v-icon>
+                        Duração: <strong class="text-white">{{ q.duration_seconds !== null ? formatDuration(q.duration_seconds) : 'Exibindo...' }}</strong>
+                      </span>
+                    </div>
+ 
+                    <div class="d-flex flex-wrap justify-space-between align-center" style="gap: 0.75rem;">
+                      <!-- Action Buttons -->
+                      <div class="d-flex flex-wrap" style="gap: 0.25rem;">
+                        <v-btn
+                          v-if="q.status === 'pending'"
+                          size="x-small"
+                          color="success"
+                          variant="flat"
+                          @click="updateQuestionStatus(q.id, 'approved')"
+                        >
+                          Aprovar
+                        </v-btn>
+                        <v-btn
+                          v-if="q.status === 'approved' || q.status === 'pending'"
+                          size="x-small"
+                          color="error"
+                          variant="flat"
+                          @click="updateQuestionStatus(q.id, 'active')"
+                        >
+                          Exibir na Tela (OBS)
+                        </v-btn>
+                        <v-btn
+                          v-if="q.status === 'active'"
+                          size="x-small"
+                          color="grey-lighten-1"
+                          variant="flat"
+                          @click="updateQuestionStatus(q.id, 'archived')"
+                        >
+                          Marcar como Respondida
+                        </v-btn>
+                        <v-btn
+                          v-if="q.status !== 'archived' && q.status !== 'pending'"
+                          size="x-small"
+                          color="grey-darken-1"
+                          variant="flat"
+                          @click="updateQuestionStatus(q.id, 'archived')"
+                        >
+                          Arquivar
+                        </v-btn>
+                        <v-btn
+                          v-if="q.status === 'archived'"
+                          size="x-small"
+                          color="success"
+                          variant="flat"
+                          @click="updateQuestionStatus(q.id, 'approved')"
+                        >
+                          Desarquivar
+                        </v-btn>
+                        <v-btn
+                          size="x-small"
+                          :color="q.is_hidden ? 'success' : 'grey'"
+                          variant="outlined"
+                          @click="toggleQuestionHidden(q)"
+                        >
+                          {{ q.is_hidden ? 'Mostrar' : 'Ocultar' }}
+                        </v-btn>
+                        <v-btn
+                          size="x-small"
+                          color="error"
+                          variant="outlined"
+                          icon="mdi-delete"
+                          style="min-width: 24px; width: 24px; height: 24px;"
+                          @click="deleteQuestion(q.id)"
+                        ></v-btn>
+                      </div>
+
+                      <!-- TikTok clip toggle -->
+                      <div v-if="q.tiktok_handle">
+                        <v-switch
+                          :model-value="q.is_tagged === 1 || q.is_tagged === true"
+                          @update:model-value="toggleQuestionTagStatus(q)"
+                          color="accent"
+                          hide-details
+                          density="compact"
+                          label="Corte Criado"
+                          inline
+                        ></v-switch>
+                      </div>
+                    </div>
+                  </v-card>
+                </div>
+
+                <v-card v-else class="text-center pa-6 bg-transparent" variant="flat">
+                  <v-icon size="48" color="grey-lighten-1" class="mb-3">mdi-help-circle-outline</v-icon>
+                  <h3 class="text-h6 text-white mb-1">Nenhuma Pergunta</h3>
+                  <p class="text-body-2 text-grey-lighten-1">Nenhuma pergunta encontrada com este filtro para esta live.</p>
+                </v-card>
+              </div>
+
+              <v-card v-else class="text-center pa-10 bg-transparent" variant="flat">
+                <v-icon size="48" color="grey-lighten-1" class="mb-3">mdi-alert-circle-outline</v-icon>
+                <h3 class="text-h6 text-white mb-1">Nenhuma Live Selecionada</h3>
+                <p class="text-body-2 text-grey-lighten-1">Selecione ou crie uma live na barra lateral esquerda para gerenciar as perguntas.</p>
+              </v-card>
+            </v-card>
+          </v-col>
+        </v-row>
+      </v-container>
+    </v-main>
+  </v-app>
 </template>
+
