@@ -21,35 +21,61 @@ livezinha/
 
 ---
 
-## 🚀 Como Iniciar Rapido
+## 🚀 Como Iniciar Rápido
 
 ### Pré-requisitos
 
 Antes de iniciar, certifique-se de ter instalado em sua máquina:
 - [Docker](https://www.docker.com/) & Docker Compose
 - [Node.js](https://nodejs.org/) (versão 18+) & npm
+- **Make** (geralmente pré-instalado em sistemas Linux/macOS)
 
 ---
 
-### Passo 1: Inicializar o Backend
+### 🛠️ Método 1: Utilizando o Makefile (Recomendado)
 
-O backend utiliza o Laravel Sail para rodar os serviços necessários (PHP, MySQL, etc.) de forma isolada em contêineres Docker.
+O projeto possui um [Makefile](./Makefile) na raiz para automatizar e unificar o gerenciamento dos projetos.
+
+#### 1. Setup Inicial
+Para criar os arquivos `.env`, instalar todas as dependências (usando Docker para o backend, sem precisar de PHP/Composer no host) e preparar o banco de dados:
+```bash
+make setup
+```
+
+#### 2. Executar os projetos juntos
+Para subir o banco de dados e a API via Docker Sail, e iniciar o servidor de desenvolvimento do frontend concorrentemente:
+```bash
+make dev
+```
+*   **Backend (API)**: Disponível em `http://localhost`
+*   **Frontend (SPA)**: Disponível em `http://localhost:5173`
+*   Para parar ambos os servidores, basta pressionar `Ctrl+C` no terminal.
+
+#### Outros comandos úteis:
+- `make sail-down`: Para os containers do Docker Sail.
+- `make migrate-fresh`: Limpa, migra e popula o banco de dados novamente.
+- `make test`: Executa a suíte de testes do backend.
+- `make lint`: Executa o formatador de código (Laravel Pint).
+- `make help`: Mostra todos os comandos disponíveis no Makefile.
+
+---
+
+### 📝 Método 2: Inicialização Manual (Alternativo)
+
+Caso prefira rodar os comandos individualmente em terminais separados:
+
+#### Passo 1: Inicializar o Backend
+O backend utiliza o Laravel Sail para rodar os serviços necessários (PHP, MySQL) de forma isolada.
 
 1. Acesse o diretório do backend:
    ```bash
    cd backend
    ```
-
 2. Copie o arquivo de variáveis de ambiente:
    ```bash
    cp .env.example .env
    ```
-
-3. Instale as dependências do PHP (caso tenha o PHP e Composer instalados localmente):
-   ```bash
-   composer install
-   ```
-   *Nota: Caso não possua PHP/Composer instalado na máquina hospedeira, você pode usar um contêiner temporário para instalar as dependências:*
+3. Instale as dependências usando um contêiner temporário (caso não possua PHP/Composer local):
    ```bash
    docker run --rm \
        -u "$(id -u):$(id -g)" \
@@ -58,51 +84,34 @@ O backend utiliza o Laravel Sail para rodar os serviços necessários (PHP, MySQ
        laravelsail/php83-composer:latest \
        composer install
    ```
-
 4. Suba os contêineres do Docker Sail em segundo plano:
    ```bash
    ./vendor/bin/sail up -d
    ```
-
-5. Execute o setup inicial do projeto (isto executará migrações e populará o banco de dados):
+5. Execute as migrações e popule o banco de dados:
    ```bash
    ./vendor/bin/sail artisan migrate:fresh --seed
    ```
 
-6. Inicie os serviços do backend (servidor web, filas e logs concorrentes):
-   ```bash
-   composer dev
-   ```
+#### Passo 2: Inicializar o Frontend
+O frontend roda diretamente na máquina hospedeira.
 
-A API estará disponível em `http://localhost`.
-
----
-
-### Passo 2: Inicializar o Frontend
-
-O frontend é uma SPA que roda separada da aplicação Laravel.
-
-1. Abra um novo terminal e acesse o diretório do frontend:
+1. Em um novo terminal, acesse o diretório do frontend:
    ```bash
    cd frontend
    ```
-
 2. Copie o arquivo de variáveis de ambiente:
    ```bash
    cp .env.example .env
    ```
-
 3. Instale as dependências do Node.js:
    ```bash
    npm install
    ```
-
 4. Inicie o servidor de desenvolvimento do Vite:
    ```bash
    npm run dev
    ```
-
-O frontend estará disponível em `http://localhost:5173`.
 
 ---
 
